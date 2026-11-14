@@ -14,7 +14,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from object_source.server import Handler  # noqa: E402
-from scripts.generate_samples import build_day, write_parquet  # noqa: E402
+from scripts.generate_samples import (  # noqa: E402
+    build_day,
+    write_parquet,
+    write_parquet_pair_equal_size,
+)
 
 DAY_START = 1735689600  # 2025-01-01T00:00:00Z
 DAY_SECONDS = 86_400
@@ -26,14 +30,22 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def _write_equal_length_pair(table, corrected_table, path: Path, corrected_path: Path) -> None:
+    """写原版 + 等长更正版：两版内容不同、字节数一致（等长更正场景）。"""
+    write_parquet_pair_equal_size(table, str(path), corrected_table, str(corrected_path))
+
+
 @pytest.fixture()
 def object_dir(tmp_path: Path) -> Path:
     d = tmp_path / "objects"
     d.mkdir()
-    table = build_day(DAY_START, step_seconds=60, seed=1)
-    write_parquet(table, d / "day1.parquet")
-    corrected = build_day(DAY_START, step_seconds=60, seed=999)
-    write_parquet(corrected, d / "day1.corrected.parquet")
+    # day1 与更正素材等长：只有内容哈希（强 ETag）能区分两版。
+    _write_equal_length_pair(
+        build_day(DAY_START, step_seconds=60, seed=1),
+        build_day(DAY_START, step_seconds=60, seed=999),
+        d / "day1.parquet",
+        d / "day1.corrected.parquet",
+    )
     table2 = build_day(DAY_START + DAY_SECONDS, step_seconds=60, seed=2)
     write_parquet(table2, d / "day2.parquet")
     return d

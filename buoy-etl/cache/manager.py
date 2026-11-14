@@ -3,6 +3,10 @@
 关键承诺
 ========
 - 每次查询先取源端强 ETag 并固定该版本；取档时 ETag 不匹配即失败。
+- 内容级校验：源端强 ETag 即内容 SHA-256，下载时对实收字节同步算哈希，
+  与固定版本不符（如等长更正的新版字节冒充旧版）即失败 —— 先删残件、
+  再释放预留，不产错版 CSV、不污染缓存；失败只涉及本次下载行，不影响
+  其他读者已租用的完整旧版，下一次查询可重新 HEAD 固定新版。
 - 同档同版全集群只下载一次：先到者 ``reserve`` 成功负责下载，后来者
   在条件变量上等待，不产生重复流量。
 - 下载按源端 ``Content-Length`` 全长预留空间；失败先删残件再释放预留。
@@ -14,9 +18,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import os
-import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -33,7 +37,7 @@ logger = logging.getLogger("buoy.cache")
 
 
 class ETagMismatch(RuntimeError):
-    """下载流中的 ETag 与查询开始时固定的版本不一致。"""
+    """下载流（响应头或实际内容）与查询开始时固定的版本不一致。"""
 
 
 class DownloadAttemptsExhausted(RuntimeError):
@@ -146,10 +150,13 @@ class CacheManager:
         assert self._client is not None
         last_beat = 0.0
         written = 0
-        # 同目录临时文件 + fsync + rename，保证读者只可能看到完整文件。
-        fd, real_tmp = tempfile.mkstemp(prefix=os.path.basename(path), suffix=".part",
-                                        dir=os.path.dirname(path))
-        os.close(fd)
+        # 固定版本的内容指纹：源端强 ETag 即内容 SHA-256 时，逐块核对实收字节。
+        expected_sha256 = _etag_sha256(etag)
+        hasher = hashlib.sha256() if expected_sha256 is not None else None
+        # 写账本登记的 tmp_path（reserve 保证同 (key,etag) 只有一个下载者），
+        # 同目录临时文件 + fsync + rename：读者只见完整文件；进程崩溃时
+        # reaper 也能按账本里的 tmp_path 精确清掉残件。
+        real_tmp = tmp_path
         try:
             async with self._client.stream("GET", f"/objects/{key}") as resp:
                 if resp.status_code == 404:
@@ -168,6 +175,8 @@ class CacheManager:
                 with open(real_tmp, "wb") as fh:
                     async for chunk in resp.aiter_bytes(chunk_size=1024 * 256):
                         fh.write(chunk)
+                        if hasher is not None:
+                            hasher.update(chunk)
                         written += len(chunk)
                         now = time.monotonic()
                         if now - last_beat >= 2.0:
@@ -180,6 +189,13 @@ class CacheManager:
                     os.fsync(fh.fileno())
             if written != size:
                 raise VersionGone(f"实际下载 {written} 字节 != 预留 {size}")
+            if hasher is not None and hasher.hexdigest() != expected_sha256:
+                # 响应头与长度都能伪装（等长更正），内容指纹不会：
+                # 收到的字节不属于本次固定版本，整份作废。
+                raise ETagMismatch(
+                    f"实收内容 SHA-256 与固定版本 {etag!r} 不符"
+                    "（取档期间源端发生等长更正？），已放弃本次下载"
+                )
             os.replace(real_tmp, path)
         finally:
             with contextlib.suppress(FileNotFoundError):
@@ -230,3 +246,14 @@ class CacheManager:
 
 def _etag_tag(etag: str) -> str:
     return etag.strip('"').replace("/", "_")
+
+
+def _etag_sha256(etag: str) -> str | None:
+    """强 ETag 若为内容 SHA-256（64 位十六进制），返回小写摘要；否则 None。
+
+    返回 None 时退化为只做响应头/长度校验（无法对内容指纹的场景）。
+    """
+    token = etag.strip('"').lower()
+    if len(token) == 64 and all(c in "0123456789abcdef" for c in token):
+        return token
+    return None

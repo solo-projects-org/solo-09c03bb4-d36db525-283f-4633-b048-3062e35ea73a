@@ -149,8 +149,11 @@ def create_app(
                 status_code=503,
             )
         except ETagMismatch as exc:
+            # 取档内容与固定版本不符（如等长更正）：残件与预留已清理，
+            # 缓存未被污染，其他版本读者不受影响，可立即重试固定新版。
             return JSONResponse(
-                {"detail": f"源端更正导致版本固定失败：{exc}"}, status_code=409
+                {"detail": f"源端更正导致版本固定失败（已清理残件与预留，可重试）：{exc}"},
+                status_code=409,
             )
         except (VersionGone, DownloadAttemptsExhausted) as exc:
             return JSONResponse({"detail": f"取档失败：{exc}"}, status_code=409)

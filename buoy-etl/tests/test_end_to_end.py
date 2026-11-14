@@ -101,13 +101,13 @@ def test_empty_window_returns_header_only(object_source, cache_paths):
 def test_concurrent_same_version_downloads_once(object_source, cache_paths):
     base_url, store = object_source
     downloads = {"count": 0}
-    original_stream = store.stream
+    original_stream = store.stream_file
 
-    def counting_stream(key, write, flush):
+    def counting_stream(fh, key, write, flush, sim):
         downloads["count"] += 1
-        return original_stream(key, write, flush)
+        return original_stream(fh, key, write, flush, sim)
 
-    store.stream = counting_stream
+    store.stream_file = counting_stream
     async def scenario():
         mgr = _manager(base_url, cache_paths, 10 * 1024 * 1024)
         await mgr.start()
@@ -175,6 +175,99 @@ def test_etag_change_midflight_fails_and_recovers(object_source, cache_paths, ob
             )
             assert _row_count(out) == 2
             await mgr.release(lease)
+        finally:
+            await mgr.close()
+    asyncio.run(scenario())
+
+
+def test_equal_length_version_mixup_detected_and_cleaned(object_source, cache_paths):
+    """等长更正冒充旧版：响应头/长度全部吻合，只有内容哈希能识破。
+
+    注入 stale_get 复现修复前竞态（GET 先发旧版响应头、延迟后才打开路径），
+    期间落进等长更正 → 客户端哈希校验失败 → 清残件、释放预留 → 下次固定新版。
+    """
+    base_url, store = object_source
+    async def scenario():
+        mgr = _manager(base_url, cache_paths, 10 * 1024 * 1024)
+        await mgr.start()
+        try:
+            etag_v1, size_v1 = await mgr.head_etag("day1.parquet")
+            store.set_simulation("day1.parquet", stale_get=True, open_delay=1.0)
+            try:
+                task = asyncio.create_task(mgr.ensure("day1.parquet", etag_v1, size_v1))
+                await asyncio.sleep(0.5)  # 响应头已发、路径未开：更正落进窗口
+                new_meta = store.correct_from_file("day1.parquet")
+                assert new_meta["size"] == size_v1  # 等长更正：长度校验无能为力
+                with pytest.raises(ETagMismatch):
+                    await task
+            finally:
+                store.clear_simulation("day1.parquet")
+
+            # 残件与预留都已清掉，缓存未被错版字节污染。
+            snap = await mgr.snapshot()
+            assert snap["entries"] == [] and snap["total_bytes"] == 0
+            leftovers = [f for f in os.listdir(cache_paths["files"])
+                         if f.endswith((".part", ".tmp"))]
+            assert leftovers == []
+
+            # 下一次查询固定新版并成功；新旧版等长但 ETag 不同。
+            etag_v2, size_v2 = await mgr.head_etag("day1.parquet")
+            assert etag_v2 == new_meta["etag"] != etag_v1
+            assert size_v2 == size_v1
+            lease = await mgr.ensure("day1.parquet", etag_v2, size_v2)
+            out = await asyncio.to_thread(
+                _collect_csv, lease.path, DAY_START, DAY_START + 120
+            )
+            assert _row_count(out) == 2
+            await mgr.release(lease)
+        finally:
+            await mgr.close()
+    asyncio.run(scenario())
+
+
+def test_failed_new_version_download_preserves_old_version_readers(
+    object_source, cache_paths
+):
+    """新版下载失败不得影响其他读者已租用的完整旧版。"""
+    base_url, store = object_source
+    async def scenario():
+        mgr = _manager(base_url, cache_paths, 10 * 1024 * 1024)
+        await mgr.start()
+        try:
+            # 1) 旧版完整落盘，读者持有租用。
+            etag_v1, size_v1 = await mgr.head_etag("day1.parquet")
+            lease_old = await mgr.ensure("day1.parquet", etag_v1, size_v1)
+
+            # 2) 源端更正出新版；注入传输失败让新版下载必败。
+            new_meta = store.correct_from_file("day1.parquet")
+            store.set_simulation("day1.parquet", fail_after=512)
+            try:
+                etag_v2, size_v2 = await mgr.head_etag("day1.parquet")
+                assert etag_v2 == new_meta["etag"] != etag_v1
+                with pytest.raises((httpx.HTTPError, ETagMismatch)):
+                    await mgr.ensure("day1.parquet", etag_v2, size_v2)
+            finally:
+                store.clear_simulation("day1.parquet")
+
+            # 3) 旧版完整条目与租用原样保留，失败的新版预留已释放。
+            snap = await mgr.snapshot()
+            entries = {e["etag"]: e for e in snap["entries"]}
+            assert etag_v1 in entries and entries[etag_v1]["state"] == "complete"
+            assert entries[etag_v1]["leases"] == 1
+            assert etag_v2 not in entries
+
+            # 4) 旧版读者照常出数。
+            out = await asyncio.to_thread(
+                _collect_csv, lease_old.path, DAY_START, DAY_START + 120
+            )
+            assert _row_count(out) == 2
+            await mgr.release(lease_old)
+
+            # 5) 清除故障后重试新版成功，两版共存。
+            lease_new = await mgr.ensure("day1.parquet", etag_v2, size_v2)
+            snap = await mgr.snapshot()
+            assert {e["etag"] for e in snap["entries"]} == {etag_v1, etag_v2}
+            await mgr.release(lease_new)
         finally:
             await mgr.close()
     asyncio.run(scenario())

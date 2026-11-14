@@ -11,6 +11,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -142,6 +143,44 @@ def test_404_for_unknown_object(server_env):
                   params={"key": "nope.parquet", "start": DAY_START, "end": DAY_START + 60},
                   timeout=10)
     assert r.status_code == 404
+
+
+def test_409_on_equal_length_version_mixup_then_recovers(server_env, object_source):
+    """GET 在途期间源端等长更正：内容哈希识破 → 409 + 清理 → 下次固定新版。"""
+    _, store = object_source
+    store.set_simulation("day1.parquet", stale_get=True, open_delay=2.0)
+    result: dict = {}
+
+    def do_query():
+        result["resp"] = httpx.get(
+            f"{server_env}/api/query",
+            params={"key": "day1.parquet", "start": DAY_START, "end": DAY_START + 60},
+            timeout=60,
+        )
+
+    try:
+        thread = threading.Thread(target=do_query)
+        thread.start()
+        time.sleep(1.0)  # 响应头已发、路径未开：更正落进休眠窗口
+        new_meta = store.correct_from_file("day1.parquet")
+        thread.join(timeout=60)
+        assert not thread.is_alive()
+        resp = result["resp"]
+        assert resp.status_code == 409
+        assert "版本" in resp.json()["detail"]
+    finally:
+        store.clear_simulation("day1.parquet")
+
+    with httpx.Client(base_url=server_env, timeout=30.0) as client:
+        # 残件与预留已清理：账本里没有该 key 的任何条目。
+        snap = client.get("/api/cache").json()
+        assert [e for e in snap["entries"] if e["key"] == "day1.parquet"] == []
+        # 下一次查询固定新版并成功。
+        retry = client.get("/api/query", params={
+            "key": "day1.parquet", "start": DAY_START, "end": DAY_START + 60})
+        assert retry.status_code == 200
+        assert retry.headers["x-cache-etag"] == new_meta["etag"]
+        assert len(retry.text.strip().splitlines()) == 2  # 表头 + 1 行
 
 
 def test_two_instances_share_one_download(two_server_envs):
